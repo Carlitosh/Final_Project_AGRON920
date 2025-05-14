@@ -1,0 +1,1031 @@
+---
+title: "AGRON 920 - Final Project"
+output: html_document
+date: "2025-05-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#install.packages("soilDB")
+#remotes::install_github("mikejohnson51/climateR")
+#remotes::install_github("rspatial/geodata")
+#install.packages("tidygeocoder")
+#install.packages("vip")
+```
+
+## Libraries
+
+```{r}
+library(soilDB)
+library(tidyverse)
+library(aqp)
+library(rnaturalearth)
+library(climateR)
+library(readxl)
+library(raster)
+library(sf)
+library(tidygeocoder)
+library(NbClust)
+library(factoextra)
+library(spdep)
+library(ade4)
+library(adespatial)
+library(geocmeans)
+library(terra)
+library(tidymodels)     # Unified modeling framework
+library(doParallel)     # For parallel processing
+library(tidyverse)      # Data manipulation and visualization
+library(ranger)         # Fast implementation of Random Forests
+library(finetune)       # Advanced tuning methods
+library(readxl)         # Excel file import
+library(patchwork)      # Combine plots
+tidymodels_prefer()
+library(vip)
+library(lwgeom)
+library(mapview)
+```
+
+```{r}
+palette<-c("#3b0001","#be0003","#ff4903","#ffdc00","#559d03" ,"#075e07",'#161f0c')
+rdylgn<-colorRampPalette(palette)
+```
+
+
+## Study area 
+
+```{r fig.width=4, fig.height=5}
+
+world <- rnaturalearth::ne_countries(scale = 'small', returnclass = 'sf')
+
+arg_location <- ggplot() + 
+  geom_sf(data = world) + 
+  geom_sf(data = argentina_sf,color = 'grey40', fill = 'grey40') +
+  coord_sf(xlim = c(-165,-30),crs = 'epsg:4326') +
+   theme() + 
+   labs(subtitle = 'Study area location')
+
+ggsave(plot = arg_location,filename = '../plots/arg_location.png',width = 4,height = 5)
+
+```
+
+
+```{r}
+argentina_sf <- rnaturalearth::ne_states() %>%
+  filter(admin == 'Argentina')
+
+argentina_map <- ggplot() + 
+  geom_sf(data = argentina_sf) +
+  geom_sf(data = cordoba_sf,fill = '#343a40') +
+  labs(x = 'Longitude', y = 'Latitude')
+
+provinces <- argentina_sf %>%
+  filter(name %in% c('Entre Ríos','Salta','Chaco','Corrientes','Buenos Aires',
+  'Tucumán','Córdoba','La Pampa','Santa Fe','Santiago del Estero','San Luis'))
+
+
+```
+
+## 2. Data collection
+
+### 2.1 Crop data
+
+```{r}
+crop_data <- read_xlsx('../data/data_ready_23_24.xlsx')
+
+crop_data <- crop_data %>%
+  mutate(
+    address = paste(Trial_Site, Province, "Argentina", sep = ", ")
+  ) %>%
+  group_by(address) %>%
+  mutate(address_id = cur_group_id(),
+         Env_index = mean(Rendimiento)) %>%
+  ungroup()
+
+
+crop_data <- geocode(.tbl =  crop_data, 
+                   address = address, method = "osm", verbose = TRUE) %>%
+  filter(is.na(long) == FALSE) %>%
+  st_as_sf(coords = c('long','lat')) %>%
+  st_set_crs(value = 'EPSG:4326:') 
+
+crop_data <- crop_data %>%
+  dplyr::select(c(Province,Trial_Site,GM,Cultivar, Empresa,Rendimiento,Env_index, geometry ))
+
+```
+
+```{r}
+study_area_plot <- crop_data %>%
+  ggplot() + 
+  geom_sf(data = argentina_sf) +
+  geom_sf(aes(color = Env_index),size = 2) +
+  geom_sf_text(aes(label = Trial_Site),check_overlap = TRUE,nudge_y = 0.25) +
+  
+  geom_sf(data = provinces,fill = NA,linewidth = 1.2) +
+  scale_color_gradientn(colours = rdylgn(100))  +
+  coord_sf(ylim = c(-42,-22),xlim = c(-70,-55)) + 
+  ylab("Latitude") + xlab("Longitude") + 
+  labs(title = 'Experiment distribution across study area',
+       color = 'Environmental \nIndex')
+
+
+ggsave(plot = study_area_plot,filename = '../plots/study_area.png',width = 8,height = 6)
+
+study_area_plot
+```
+
+
+### 2.2 Climate data 
+
+```{r}
+weather_vars <- climateR::getTerraClimNormals(AOI = argentina_sf,
+                              varname = c('aet',"ppt",'tmax','tmin',"vpd"),
+                              month = c(1,2,3,4,11,12))
+
+plot(weather_vars$tmax)
+```
+
+### 2.3 Soil data
+
+```{r}
+# soil_data <- soilDB::fetchSoilGrids(x = argentina_sf,depth_intervals = "0-5",
+#                        variables = c("soc", "bdod", "ocd", "ocs"), 
+#                        filename = '../data/soil_data.tif',
+#                        grid = TRUE)
+
+
+soil_data <- geodata::soil_world(stat="mean",
+                                 var=c("soc","bdod",
+                                       "sand",'silt','phh2o'),
+                           depth=5, path=tempdir())
+
+
+soil_data_crop <- crop(soil_data, argentina_sf)
+soil_data_mask <- mask(soil_data_crop, argentina_sf)
+
+plot(soil_data_mask)
+```
+
+
+## 3.Data integration
+
+
+### 3.1 Grid creation
+
+```{r}
+argentina_grid <- provinces %>%
+  st_set_crs(st_crs("epsg:4326")) %>%
+  st_transform(32720) %>%
+  st_make_grid(cellsize = 10000, what = "centers") %>% #cellsize = 10 meters
+  st_as_sf() %>% 
+  st_intersection(st_transform(st_as_sf(provinces),crs = 32720)) %>%
+  st_set_crs(st_crs("epsg:32720")) %>%
+  mutate(X_proj = st_coordinates(.)[,1],
+         Y_proj = st_coordinates(.)[,2]) %>%
+  st_transform(4326) %>%
+  mutate(X = st_coordinates(.)[,1],
+         Y = st_coordinates(.)[,2]) %>%
+  rowid_to_column() %>%
+  dplyr::select(c(rowid,name,X,Y,X_proj,Y_proj))
+
+plot(argentina_grid)
+```
+
+
+```{r fig.height=8, fig.width=5}
+ggplot() + 
+  geom_sf(data = argentina_grid,size=0.01, alpha=0.4) + 
+  geom_sf(data = argentina_sf, fill=NA, color='black',linewidth = 1, alpha=0.1) + 
+  coord_sf(crs = 3857) +
+  labs(x = 'Longitude', y = 'Latitude', 'Grid point across Kansas')
+```
+
+
+```{r message=FALSE}
+df_grid <- data.frame(argentina_grid, 
+           raster::extract(weather_vars$aet, argentina_grid),
+           raster::extract(weather_vars$tmax, argentina_grid),
+           raster::extract(weather_vars$ppt, argentina_grid),
+           raster::extract(weather_vars$tmin, argentina_grid),
+           raster::extract(weather_vars$vpd, argentina_grid),
+           
+           raster::extract(soil_data_mask$`soc_0-5cm`, argentina_grid),
+           raster::extract(soil_data_mask$`bdod_0-5cm`, argentina_grid),
+           raster::extract(soil_data_mask$`sand_0-5cm`, argentina_grid),
+           raster::extract(soil_data_mask$`silt_0-5cm`, argentina_grid),
+           raster::extract(soil_data_mask$`phh2o_0-5cm`, argentina_grid)) %>%
+  dplyr::select(-c(ID.1,ID.2,ID.3,ID.4,ID.5,ID.6,ID.7,ID.8,ID.9)) %>%
+  na.exclude() %>%
+  rename_with(.fn = ~ map_chr(., function(col_name) {
+    str_replace(
+      col_name,
+      "^([a-zA-Z0-9]+)_\\d{4}\\.(\\d{2})\\.\\d{2}_\\d{8}$",
+      "\\1_\\2"
+    )
+  }))
+
+
+
+cols_filtered <- names(df_grid) %>%
+  keep(~ str_detect(., paste0("_(", paste(sprintf("%02d", c(1, 2, 3, 4, 11, 12)) , collapse = "|"), ")$")))
+
+df_grid.X <- df_grid %>%
+  dplyr::select(X_proj,Y_proj, all_of(cols_filtered),soc_0.5cm,bdod_0.5cm,sand_0.5cm,silt_0.5cm,phh2o_0.5cm)
+
+```
+
+
+
+
+## 4. Feature engineering
+
+### 4.1 Principal component analysis
+
+```{r}
+Biplot_sPCA <- function(sPca, title){
+
+PCA <- cbind(sPca$c1[,1], sPca$c1[,2])
+PCA <- tibble::rownames_to_column(as.data.frame(PCA),
+                                  var = "Variables")
+colnames(PCA) <- c("variables","PC1","PC2")
+rownames(PCA) <- rownames(sPca$c1)
+
+angle <- seq(-pi, pi, length = 50) 
+df <- data.frame(x = sin(angle), y = cos(angle)) 
+
+angle <- seq(-pi, pi, length = 50) 
+df <- data.frame(x = sin(angle), y = cos(angle)) 
+
+pc1_var_exp <- as.double(c(as.vector(sPca$eig/sum(sPca$eig)))[1])*100
+pc2_var_exp <- as.double(c(as.vector(sPca$eig/sum(sPca$eig)))[2])*100
+
+pplot_pca1 <- ggplot() +
+  geom_path(aes(x, y), data = df, colour="grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  xlab(paste0("PC1 (", round(pc1_var_exp,2),"%)")) + 
+  ylab(paste0("PC2 (", round(pc2_var_exp,2),"%)")) +
+  geom_segment(data=PCA, show.legend = TRUE,size= 1.2, lineend = "round", linejoin = "round",  
+               aes(x = 0, y = 0, xend = PC1, yend = PC2, colour = as.numeric(PC1)), alpha=0.4, 
+               arrow = arrow(length = unit(2, 'mm'), type = "open"),
+               color = "orange") +
+
+  ggrepel::geom_label_repel(data=PCA, aes(x=PC1,y=PC2,
+                           label=rownames(PCA)), colour = 'black', fill = 'white',
+                           size=3, direction="both", max.overlaps = 350) +
+  labs(color=PCA$PC1, title = "", subtitle = title)  +
+   theme(aspect.ratio= 1) + 
+   theme_bw(base_size = 15) 
+   
+return(pplot_pca1)
+}
+
+```
+
+```{r}
+# coords land_degradation  land_degradation[,16:17]
+# data land_degradation[,0:15]
+
+PCA_vars <- dudi.pca(df_grid.X[,-c(1:2)], 
+                center=T, scale = TRUE, 
+                scannf = FALSE, nf = 5)
+
+coords  <- sp::coordinates(df_grid.X[,c(1:2)]) 
+gri <- dnearneigh(coords,0,150000) 
+lw2<- nb2listw(gri, style = "W")
+
+
+sPCA_vars <- adespatial::multispati(PCA_vars, lw2, 
+                                 scannf = F, nfposi = 5)
+
+df_PCA <- sPCA_vars$li[,1:2]
+colnames(df_PCA) <- c("CS1","CS2")
+df_grid <-cbind(df_grid, df_PCA)
+
+df_grid[,c('CS1','CS2')]
+```
+
+```{r fig.height=10, fig.width=10}
+biplot_sPCA <- Biplot_sPCA(sPCA_vars, 'Biplot - sPCA')
+biplot_sPCA
+ggsave("../plots/biplot_sPCA.png",biplot_sPCA,
+       width = 15,height = 15,units = "cm")
+```
+
+
+### 4.2 Spatial clustering analysis
+
+```{r}
+future::plan(future::multicore(workers = availableCores(constraints = "multicore")))
+FCM2<- select_parameters.mc("SFCM", df_grid[,c('CS1','CS2')], 
+                            k = 2, m = 1.3, alpha = 1.5, 
+                            nblistw = lw2, lag_method='median')
+
+FCM3 <- select_parameters.mc("SFCM", df_grid[,c('CS1','CS2')], 
+                            k = 3, m = 1.3, alpha = 1.5, 
+                            nblistw = lw2, lag_method='median')
+
+FCM4 <- select_parameters.mc("SFCM", df_grid[,c('CS1','CS2')], 
+                            k = 4, m = 1.3, alpha = 1.5, 
+                            nblistw = lw2, lag_method='median')
+
+FCM5 <- select_parameters.mc("SFCM", df_grid[,c('CS1','CS2')], 
+                            k = 5, m = 1.3, alpha = 1.5, 
+                            nblistw = lw2, lag_method='median')
+
+FCM6 <- select_parameters.mc("SFCM", df_grid[,c('CS1','CS2')], 
+                            k = 6, m = 1.3, alpha = 1.5, 
+                            nblistw = lw2, lag_method='median')
+
+FCM7 <- select_parameters.mc("SFCM", df_grid[,c('CS1','CS2')], 
+                            k = 7, m = 1.3, alpha = 1.5, 
+                            nblistw = lw2, lag_method='median')
+
+
+FCM_indices <- rbind(as.numeric(FCM2),
+                     as.numeric(FCM3),
+                     as.numeric(FCM4),
+                     as.numeric(FCM5),
+                     as.numeric(FCM6),
+                     as.numeric(FCM7))
+
+FCM_indices <- t(FCM_indices)
+FCM_indices <- FCM_indices[0:10,]
+
+rownames(FCM_indices) <- c('Silhouette Index',
+                           'Partition Entropy',
+                           'Partition Coef.',
+                           'Mod. Partit. Coef.',
+                           'Xie-Beni index',
+                           'Fukuyama-Sugeno index',
+                           'Explained.inertia',
+                           'spConsistency',
+                           'spConsistency_05.5.',
+                           'spConsistency_95.95.')
+
+colnames(FCM_indices) <- c('C2','C3','C4','C5','C6','C7')
+
+FCM_climate_cluster_indices <- tibble::rownames_to_column(as.data.frame(FCM_indices),
+                                  var = "Indices")
+
+FCM_climate_cluster_indices <- FCM_climate_cluster_indices %>%
+                  tidyr::pivot_longer('C2':'C7', 
+                    names_to = "Clusters", 
+                    values_to = "value", names_repair = "minimal")
+
+
+plot_index_cluster <- ggplot(FCM_climate_cluster_indices, aes(Clusters, value), group = Indices) + 
+  geom_line(aes(colour = Indices,group = Indices)) +
+  geom_point(aes(colour = Indices, group = Indices)) + 
+  labs(title = "Optimal number of classes - Method Spatial Fuzzy c-means ",
+       subtitle = "Clustering analysis using soil and climate data") + 
+  facet_wrap(~Indices, scales = "free") 
+
+ggsave("../plots/cluster_indexes.png",width = 12)  
+plot_index_cluster
+
+```
+
+```{r}
+future::plan(future::multicore(workers = availableCores(constraints = "multicore")))
+FCM_cluster_grid <- SFCMeans(df_grid[,c('CS1','CS2')], 
+                               lw2,
+                               k = 6, 
+                               m = 1.5, 
+                               alpha = 0.3, 
+                               standardize = FALSE,
+                               lag_method = 'median',
+                               verbose = FALSE)
+```
+
+
+
+
+```{r}
+
+df_grid_clusters <- cbind(df_grid, as.integer(as.factor(FCM_cluster_grid$Groups))) %>%
+  rename(clusters = `as.integer(as.factor(FCM_cluster_grid$Groups))`)
+
+
+
+# cluster_raster <- rast(rasterFromXYZ(data.frame(as.data.frame(df_grid_clusters[c('X_proj','Y_proj','clusters')])),
+#                                   crs = 32720)) %>%
+#   project("EPSG:4326")
+
+cluster_raster <- rast(df_grid_clusters[c('X_proj','Y_proj','clusters')], type = "xyz") %>%
+  `crs<-`("EPSG:32720")  %>%
+  project("EPSG:4326")
+
+
+clusters_arg <- ggplot() +
+  geom_sf(data = argentina_sf) + 
+  geom_point(data = df_grid_clusters, aes(x = X,y = Y,color = as.factor(clusters)), size=0.5) +
+  geom_sf(data = provinces,color = 'black', fill=NA, linewidth = 0.5,alpha = 0.5) +
+  geom_sf(data = crop_data,color = 'black') + 
+  scale_color_viridis_d(option = 'plasma') +
+  coord_sf(ylim = c(-42,-22),xlim = c(-70,-55)) + 
+  ylab("Latitude") + xlab("Longitude") + 
+      labs(color= 'Clusters',title = "Agro-Environmental zones in Argentina",
+       subtitle = "sPCA + Geo Fuzzy c-means")
+  
+ggsave(clusters_arg,filename = '../plots/clusters_arg.png',width = 6,height = 6)
+
+clusters_arg
+```
+
+```{r}
+df_summary_weather <- df_grid_clusters %>%
+  dplyr::select(-c(name, X, Y, X_proj, Y_proj, ID, x,  
+                   bdod_0.5cm, sand_0.5cm, soc_0.5cm, 
+                   silt_0.5cm, phh2o_0.5cm, CS1, CS2)) %>%
+  pivot_longer(
+    cols = matches("^(aet|ppt|tmin|tmax|vpd)_"),
+    names_to = c("variable", "mes"),
+    names_sep = "_",
+    values_to = "valor"
+  ) %>%
+  mutate(mes = as.integer(mes)) %>%
+  filter(mes %in% c(1,2,3,4,11,12)) %>%
+  group_by(rowid,clusters, variable) %>%
+  reframe(
+    resumen = case_when(
+      variable == "ppt" ~ sum(valor, na.rm = TRUE),
+      TRUE ~ mean(valor, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = resumen
+  ) %>%
+  unnest() %>%
+  pivot_longer(cols = -c(rowid, clusters, .groups),
+               names_to = 'weather_vars',values_to = 'values') %>% 
+  distinct()
+```
+
+```{r fig.height=5,fig.width=10}
+plot_summary_weather <- df_summary_weather %>%
+  dplyr::select(-c(rowid,`.groups`)) %>%
+  mutate(clusters = as.factor(clusters)) %>%
+  #filter(weather_vars =='ppt') %>%
+  ggplot() +
+  geom_boxplot(aes(x = clusters, y = values,fill = clusters)) +
+  coord_flip() +
+  facet_wrap(~weather_vars, ncol = 3,nrow = 3, scale ='free') +
+  scale_fill_viridis_d(option = 'plasma') + 
+  labs(fill = 'Clusters',title = 'Weather variables distribution across clusters')
+
+
+ggsave(plot_summary_weather,filename = '../plots/plot_summary_weather.png',width = 10,height = 5)
+plot_summary_weather
+```
+
+```{r}
+plot_summary_soil <- df_grid_clusters %>%
+  dplyr::select(c(clusters, 
+                   bdod_0.5cm, sand_0.5cm, soc_0.5cm, 
+                   silt_0.5cm, phh2o_0.5cm)) %>%
+  pivot_longer(cols = -clusters,names_to = 'soil_vars',values_to = 'values') %>%
+  mutate(clusters = as.factor(clusters)) %>%
+  #filter(weather_vars =='ppt') %>%
+  ggplot() +
+  geom_boxplot(aes(x = clusters, y = values,fill = clusters)) +
+  coord_flip() +
+  facet_wrap(~soil_vars, ncol = 3,nrow = 3, scale ='free') +
+  scale_fill_viridis_d(option = 'plasma') + 
+  labs(fill = 'Clusters',title = 'Soil variables distribution across clusters')
+
+ggsave(plot_summary_soil,filename = '../plots/plot_summary_soil.png',width = 10,height = 5)
+plot_summary_soil
+```
+
+
+
+### 4.3 Crop data integration
+
+
+```{r message=FALSE}
+clusters_columns_df_crops <- raster::extract(round(cluster_raster$clusters), crop_data)
+
+df_crop <- data.frame(crop_data, 
+           raster::extract(weather_vars$aet, crop_data),
+           raster::extract(weather_vars$tmax, crop_data),
+           raster::extract(weather_vars$ppt, crop_data),
+           raster::extract(weather_vars$tmin, crop_data),
+           raster::extract(weather_vars$vpd, crop_data),
+           
+           raster::extract(soil_data_mask$`soc_0-5cm`, crop_data),
+           raster::extract(soil_data_mask$`bdod_0-5cm`, crop_data),
+           raster::extract(soil_data_mask$`sand_0-5cm`, crop_data),
+           raster::extract(soil_data_mask$`silt_0-5cm`, crop_data),
+           raster::extract(soil_data_mask$`phh2o_0-5cm`, crop_data),
+           raster::extract(round(cluster_raster$clusters), crop_data)
+           ) %>%
+  dplyr::select(-c(ID.1,ID.2,ID.3,ID.4,ID.5,ID.6,ID.7,ID.8,ID.9)) %>%
+  #na.exclude() %>%
+  rename_with(.fn = ~ map_chr(., function(col_name) {
+    str_replace(
+      col_name,
+      "^([a-zA-Z0-9]+)_\\d{4}\\.(\\d{2})\\.\\d{2}_\\d{8}$",
+      "\\1_\\2"
+    )
+  })) 
+
+
+
+cols_filtered <- names(df_crop) %>%
+  keep(~ str_detect(., paste0("_(", paste(sprintf("%02d", c(1, 2, 3, 4, 11, 12)) , collapse = "|"), ")$")))
+
+df_crop.X <- df_crop %>%
+  st_as_sf(sf_column_name = "geometry") %>%
+  st_set_crs(st_crs("epsg:4326")) %>%
+  mutate(X = st_coordinates(.)[,1],
+         Y = st_coordinates(.)[,2]) %>%
+  st_transform(32720) %>%
+  mutate(X_proj = st_coordinates(.)[,1],
+         Y_proj = st_coordinates(.)[,2])  %>%
+  dplyr::select(X_proj,Y_proj, Province, Trial_Site , GM, Cultivar, Empresa,Rendimiento,Env_index,
+                all_of(cols_filtered),soc_0.5cm,bdod_0.5cm,sand_0.5cm,silt_0.5cm,phh2o_0.5cm,clusters) %>%
+  mutate(clusters = as.factor(clusters)) %>%
+  group_by(Cultivar) %>%
+  mutate(Cultivar_id = as.factor(cur_group_id())) %>%
+  ungroup()  %>% 
+  mutate_if(is.character, as.factor) %>%
+  rename(Yield = Rendimiento) %>%
+  st_drop_geometry() %>%
+  na.exclude()
+
+```
+
+```{r}
+df_crop.X %>%
+  ggplot() + 
+  geom_smooth(aes(x = Env_index,y=Yield,color = Cultivar, group = Cultivar),
+              alpha = 1/10,linewidth = 0.5,
+              se = FALSE,method = 'lm',formula = 'y ~x', show.legend = FALSE) + 
+  facet_wrap(~clusters)
+
+```
+
+```{r}
+plot_summary_yield <- df_crop.X  %>%
+  dplyr::select(c(clusters,GM, Yield)) %>%
+  #pivot_longer(cols = -clusters,names_to = 'soil_vars',values_to = 'values') %>%
+  mutate(clusters = as.factor(clusters)) %>%
+  #filter(weather_vars =='ppt') %>%
+  ggplot() +
+  geom_boxplot(aes(x = clusters, y = Yield, fill = clusters)) +
+  coord_flip() +
+  #facet_wrap(~GM, ncol = 3,nrow = 3, scale ='free') +
+  scale_fill_viridis_d(option = 'plasma') + 
+  labs(fill = 'Clusters',title = 'Soybean seed yield  distribution across clusters')
+
+ggsave(plot_summary_yield,filename = '../plots/plot_summary_yield.png',width = 10,height = 5)
+plot_summary_yield
+```
+
+
+
+
+## 3. Machine Learning Workflow
+
+### 3.1 Data Splitting
+
+For robust model evaluation, we split the data into training (70%) and testing (30%) sets, stratified by the target variable.
+
+```{r data_split}
+set.seed(27)
+
+df_split <- initial_split(df_crop.X, prop = 0.7,strata = 'clusters')
+df_split
+```
+
+```{r extract_train_data}
+# Extract the training dataset
+df_train <- training(df_split)
+df_train
+```
+
+```{r extract_test_data}
+# Extract the testing dataset
+df_test <- testing(df_split)
+df_test
+```
+
+### 3.2 Visualizing Data Distribution
+
+Let's verify that our training and testing sets have similar distributions of the target variable.
+
+```{r visualize_data_distribution}
+# Combine the data frames with dataset labels
+plot_train <- df_train %>% mutate(Dataset = "Train")
+plot_test <- df_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create a density plot to compare distributions
+dist_plot_train_test <- ggplot(data = combined_data) +
+  geom_rug(aes(x = Yield, fill = Dataset)) +
+  geom_density(aes(x = Yield, fill = Dataset), color = NA, alpha = 0.3) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Soybean Yield (kg/ha)", 
+       y = "Density", 
+       fill = "Dataset",
+       title = "Distribution of Soybean Yield in Training and Testing Sets")
+
+ggsave(dist_plot_train_test,filename = '../plots/dist_plot_train_test.png',width = 6,height = 3)
+dist_plot_train_test
+```
+  
+### 3.3 Feature Engineering
+
+We define a recipe for data preprocessing, removing unnecessary columns.
+
+```{r define_recipe}
+# Create a recipe to preprocess the data
+df_recipe <-
+  # Defining predicted and predictor variables
+  recipe(Yield ~ ., data = df_train) %>%
+  # Remove year and block variables as they shouldn't influence predictions
+  step_rm(X_proj,Y_proj,Province,Trial_Site,GM,Cultivar,Empresa,Env_index) 
+
+# Display the recipe
+df_recipe
+```
+
+```{r prepare_recipe}
+# Prepare (train) the recipe on the training data
+df_prep <- df_recipe %>% prep()
+df_prep
+```
+
+## 4. Model Training
+
+### 4.1 Model Specification
+
+We define a Random Forest model with hyperparameters to be tuned.
+
+```{r model_specification}
+# Define the Random Forest model with tunable parameters
+rf_spec <- 
+  # Specifying Random Forest with parameters to tune
+  rand_forest(
+    mtry = tune(),    # Number of variables randomly sampled at each split
+    trees = tune(),   # Number of trees in the forest
+    min_n = tune()    # Minimum node size
+  ) %>% 
+  # Use ranger as the computation engine
+  set_engine("ranger", importance = "permutation") %>% 
+  # Specify we're doing regression
+  set_mode("regression")
+
+# Display the model specification
+rf_spec
+```
+
+
+### 4.2 Hyperparameter Tuning
+
+We'll use 5-fold cross-validation to find the optimal hyperparameters.
+
+```{r create_cv_folds}
+# Create 5-fold cross-validation resamples
+set.seed(15)
+resampling_foldcv <- vfold_cv(df_train, repeats = 3, v = 5)
+```
+
+```{r tune_hyperparameters}
+# Tune the model using racing methods to efficiently search the parameter space
+set.seed(45)
+# Use parallel processing to speed up computation
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Perform race-based tuning with ANOVA to eliminate poor-performing models early
+rf_grid_result <- tune_race_anova(
+  object = rf_spec,
+  preprocessor = df_recipe,
+  resamples = resampling_foldcv,
+  grid = 25  # Try 50 different hyperparameter combinations
+)
+
+# Stop parallel processing
+stopImplicitCluster()
+
+
+```
+
+```{r}
+library(finetune)  # needed for tune_bayes()
+
+# Define parameter ranges explicitly (optional)
+rf_param <- parameters(rf_spec) %>%
+  recipes::update(
+    mtry = mtry(c(1L, 100L)),
+    trees = trees(c(100L, 4000L)),
+    min_n = min_n(c(2L, 20L))
+  )
+
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Use tune_bayes instead of tune_race_anova
+rf_grid_result <- tune_bayes(
+  object = rf_spec,
+  preprocessor = df_recipe,
+  resamples = resampling_foldcv,
+  param_info = rf_param,
+  initial = 10,  # number of initial random configurations
+  iter = 30,     # number of Bayesian iterations
+  metrics = metric_set(rmse, rsq),
+  control = control_bayes(
+    no_improve = 10,
+    verbose = TRUE,
+    save_pred = TRUE
+  )
+)
+
+stopImplicitCluster()
+```
+
+
+
+```{r}
+# View metrics from the first fold
+rf_grid_result$.metrics[[1]]
+```
+
+
+
+### 4.3 Selecting Optimal Hyperparameters
+
+We'll evaluate different strategies for selecting the best hyperparameters.
+
+```{r select_by_rmse}
+# Selection methods based on RMSE
+# Method 1: Select model within 2% of the best RMSE, but with fewer trees
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("trees",
+                     metric = "rmse",
+                     limit = 2) %>% 
+  mutate(source = "best_rmse")
+
+# Method 2: Simply select the model with the lowest RMSE
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse") %>% 
+  mutate(source = "best_rmse_2")
+
+# Method 3: Select model within one standard error of the best RMSE
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        mtry) %>% 
+  mutate(source = "best_rmse_3")
+```
+
+```{r select_by_r2}
+# Selection methods based on R² (coefficient of determination)
+# Method 1: Select model within 2% of the best R², but with fewer trees
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("trees",
+                     metric = "rsq",
+                     limit = 2) %>% 
+  mutate(source = "best_r2")
+
+# Method 2: Simply select the model with the highest R²
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq") %>% 
+  mutate(source = "best_r2_2")
+
+# Method 3: Select model within one standard error of the best R²
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        mtry) %>%
+  mutate(source = "best_r2_3")
+```
+
+```{r combine_hyperparameters}
+# Combine all candidate hyperparameter sets for comparison
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+### 4.4 Comparing Hyperparameter Performance
+
+We evaluate each set of hyperparameters on our validation data to select the best.
+
+```{r hyperparameter_comparison_function}
+# Function to compare the performance of different hyperparameter sets
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    mtry = numeric(),
+    trees = numeric(),
+    min_n = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification with current parameters
+    set.seed(10)
+    current_spec <- rand_forest(
+      mtry = current_params$mtry,
+      trees = current_params$trees,
+      min_n = current_params$min_n
+    ) %>%
+      set_engine("ranger", importance = "permutation") %>%
+      set_mode('regression')
+    
+    # Fit model on training data and evaluate on testing data
+    current_fit <- last_fit(current_spec, recipe, split = split)
+    current_metrics <- current_fit %>% collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      mtry = current_params$mtry,
+      trees = current_params$trees,
+      min_n = current_params$min_n,
+      rmse = current_rmse,
+      source = current_params$source
+    )
+  }
+  
+  # Find the best combination (lowest RMSE)
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    slice(1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+# Compare all hyperparameter sets
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = df_recipe,
+  split = df_split
+)
+
+# Display results
+print(results)
+```
+
+### 4.5 Final Model Specification
+
+Using the best hyperparameters, we specify our final model.
+
+```{r final_model_specification}
+# Create the final model specification with the best hyperparameters
+# Note: Use the source identified as best from the results above
+final_spec <- rand_forest(
+  trees = best_rmse$trees,
+  mtry = best_rmse$mtry,
+  min_n = best_rmse$min_n
+) %>%
+  # Use ranger with permutation importance for later interpretation
+  set_engine("ranger", importance = "permutation") %>% 
+  # Regression mode
+  set_mode("regression")
+
+# Display the final specification  
+final_spec
+```
+
+## 5. Model Validation
+
+Now we fit the model on the training data and evaluate on the test data.
+
+```{r final_model_fit}
+# Fit the final model and predict on test data
+set.seed(10)
+final_fit <- last_fit(
+  final_spec,
+  df_recipe,
+  split = df_split
+)
+
+# Display predictions on test data
+final_fit %>%
+  collect_predictions()
+```
+
+### 5.1 Test Set Performance
+
+Let's examine how well our model performs on the unseen test data.
+
+```{r test_metrics}
+# Calculate performance metrics on the test set
+final_fit %>%
+  collect_metrics()
+```
+
+### 5.2 Training Set Performance
+
+For comparison, we also check performance on the training data to assess potential overfitting.
+
+```{r train_metrics}
+# RMSE on training data
+train_metrics <- final_spec %>%
+  fit(Yield ~ .,
+      data = bake(df_prep, df_train)) %>%
+  augment(new_data = bake(df_prep, df_train))
+
+# Calculate and combine RMSE and R² on training data
+train_metrics %>% 
+  rmse(Yield, .pred) %>%
+  bind_rows(
+    train_metrics %>% 
+    rsq(Yield, .pred)
+  )
+```
+
+### 5.3 Prediction Visualization
+
+Let's visualize how well our predictions match the observed values.
+
+```{r predicted_vs_observed}
+# Create scatter plot of predicted vs. observed values
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(
+    obs = Yield,
+    pred = .pred,
+    print_eq = TRUE,
+    print_metrics = TRUE,
+    metrics_list = c("R2", "RMSE", "KGE","NSE"),
+    # Customize metrics position
+    position_metrics = c(x=1000, y=6550),
+    position_eq = c(x=1000, y=5000)
+  )
+
+ggsave(plot = plot,filename = '../plots/predict_vs_observed.png',width = 5,height = 5)
+
+# Display the plot
+plot
+```
+
+### 5.4 Comprehensive Performance Metrics
+
+Let's calculate a comprehensive set of performance metrics.
+
+```{r comprehensive_metrics}
+# Get predictions on test set
+test_results <- final_fit %>% 
+  collect_predictions()
+
+# Calculate multiple performance metrics
+metrics <- test_results %>% 
+  summarise(
+    RMSE = rmse_vec(truth = Yield, estimate = .pred),
+    R2 = rsq_vec(Yield, .pred),
+    Correlation = cor(.pred, Yield),
+    SD = sd(.pred)  # Standard deviation of predictions
+  )
+
+# Display the metrics
+print(metrics)
+```
+
+## 6. Feature importance
+
+
+```{r}
+# 3. Extraer la importancia de variables
+vip_df <- final_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vi()  # Usa vip::vi() del paquete {vip}
+
+# 4. Visualizarla
+var_importance <- vip_df %>%
+  mutate(Variable = fct_reorder(Variable, Importance)) %>%  # <- clave para ordenar
+  ggplot(aes(x = Variable, y = Importance)) +
+  geom_col() +
+  coord_flip() + 
+  labs(title = 'Variable importance')
+
+var_importance
+ggsave(plot = var_importance,filename = '../plots/var_importance.png',width = 8,height = 5)
+
+var_importance
+```
+
+
+
+
+
+
+
+
+
