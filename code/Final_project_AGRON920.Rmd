@@ -14,6 +14,8 @@ knitr::opts_chunk$set(echo = TRUE)
 #remotes::install_github("rspatial/geodata")
 #install.packages("tidygeocoder")
 #install.packages("vip")
+#install.packages("aqp")
+#install.packages("rnaturalearth")
 ```
 
 ## Libraries
@@ -35,13 +37,13 @@ library(ade4)
 library(adespatial)
 library(geocmeans)
 library(terra)
-library(tidymodels)     # Unified modeling framework
-library(doParallel)     # For parallel processing
-library(tidyverse)      # Data manipulation and visualization
-library(ranger)         # Fast implementation of Random Forests
-library(finetune)       # Advanced tuning methods
-library(readxl)         # Excel file import
-library(patchwork)      # Combine plots
+library(tidymodels)     
+library(doParallel)     
+library(tidyverse)      
+library(ranger)         
+library(finetune)     
+library(readxl)         
+library(patchwork)      
 tidymodels_prefer()
 library(vip)
 library(lwgeom)
@@ -285,9 +287,6 @@ return(pplot_pca1)
 ```
 
 ```{r}
-# coords land_degradation  land_degradation[,16:17]
-# data land_degradation[,0:15]
-
 PCA_vars <- dudi.pca(df_grid.X[,-c(1:2)], 
                 center=T, scale = TRUE, 
                 scannf = FALSE, nf = 5)
@@ -408,11 +407,6 @@ FCM_cluster_grid <- SFCMeans(df_grid[,c('CS1','CS2')],
 df_grid_clusters <- cbind(df_grid, as.integer(as.factor(FCM_cluster_grid$Groups))) %>%
   rename(clusters = `as.integer(as.factor(FCM_cluster_grid$Groups))`)
 
-
-
-# cluster_raster <- rast(rasterFromXYZ(data.frame(as.data.frame(df_grid_clusters[c('X_proj','Y_proj','clusters')])),
-#                                   crs = 32720)) %>%
-#   project("EPSG:4326")
 
 cluster_raster <- rast(df_grid_clusters[c('X_proj','Y_proj','clusters')], type = "xyz") %>%
   `crs<-`("EPSG:32720")  %>%
@@ -604,13 +598,12 @@ df_split
 ```
 
 ```{r extract_train_data}
-# Extract the training dataset
 df_train <- training(df_split)
 df_train
 ```
 
 ```{r extract_test_data}
-# Extract the testing dataset
+
 df_test <- testing(df_split)
 df_test
 ```
@@ -620,12 +613,11 @@ df_test
 Let's verify that our training and testing sets have similar distributions of the target variable.
 
 ```{r visualize_data_distribution}
-# Combine the data frames with dataset labels
+
 plot_train <- df_train %>% mutate(Dataset = "Train")
 plot_test <- df_test %>% mutate(Dataset = "Test")
 combined_data <- bind_rows(plot_train, plot_test)
 
-# Create a density plot to compare distributions
 dist_plot_train_test <- ggplot(data = combined_data) +
   geom_rug(aes(x = Yield, fill = Dataset)) +
   geom_density(aes(x = Yield, fill = Dataset), color = NA, alpha = 0.3) +
@@ -644,19 +636,15 @@ dist_plot_train_test
 We define a recipe for data preprocessing, removing unnecessary columns.
 
 ```{r define_recipe}
-# Create a recipe to preprocess the data
 df_recipe <-
-  # Defining predicted and predictor variables
   recipe(Yield ~ ., data = df_train) %>%
-  # Remove year and block variables as they shouldn't influence predictions
+
   step_rm(X_proj,Y_proj,Province,Trial_Site,GM,Cultivar,Empresa,Env_index) 
 
-# Display the recipe
 df_recipe
 ```
 
 ```{r prepare_recipe}
-# Prepare (train) the recipe on the training data
 df_prep <- df_recipe %>% prep()
 df_prep
 ```
@@ -668,20 +656,16 @@ df_prep
 We define a Random Forest model with hyperparameters to be tuned.
 
 ```{r model_specification}
-# Define the Random Forest model with tunable parameters
 rf_spec <- 
-  # Specifying Random Forest with parameters to tune
+
   rand_forest(
-    mtry = tune(),    # Number of variables randomly sampled at each split
-    trees = tune(),   # Number of trees in the forest
-    min_n = tune()    # Minimum node size
+    mtry = tune(),    
+    trees = tune(),   
+    min_n = tune()   
   ) %>% 
-  # Use ranger as the computation engine
   set_engine("ranger", importance = "permutation") %>% 
-  # Specify we're doing regression
   set_mode("regression")
 
-# Display the model specification
 rf_spec
 ```
 
@@ -691,35 +675,13 @@ rf_spec
 We'll use 5-fold cross-validation to find the optimal hyperparameters.
 
 ```{r create_cv_folds}
-# Create 5-fold cross-validation resamples
 set.seed(15)
 resampling_foldcv <- vfold_cv(df_train, repeats = 3, v = 5)
 ```
 
-```{r tune_hyperparameters}
-# Tune the model using racing methods to efficiently search the parameter space
-set.seed(45)
-# Use parallel processing to speed up computation
-registerDoParallel(cores = parallel::detectCores() - 1)
-
-# Perform race-based tuning with ANOVA to eliminate poor-performing models early
-rf_grid_result <- tune_race_anova(
-  object = rf_spec,
-  preprocessor = df_recipe,
-  resamples = resampling_foldcv,
-  grid = 25  # Try 50 different hyperparameter combinations
-)
-
-# Stop parallel processing
-stopImplicitCluster()
-
-
-```
 
 ```{r}
-library(finetune)  # needed for tune_bayes()
 
-# Define parameter ranges explicitly (optional)
 rf_param <- parameters(rf_spec) %>%
   recipes::update(
     mtry = mtry(c(1L, 100L)),
@@ -730,14 +692,13 @@ rf_param <- parameters(rf_spec) %>%
 set.seed(45)
 registerDoParallel(cores = parallel::detectCores() - 1)
 
-# Use tune_bayes instead of tune_race_anova
 rf_grid_result <- tune_bayes(
   object = rf_spec,
   preprocessor = df_recipe,
   resamples = resampling_foldcv,
   param_info = rf_param,
-  initial = 10,  # number of initial random configurations
-  iter = 30,     # number of Bayesian iterations
+  initial = 10,  
+  iter = 30,     
   metrics = metric_set(rmse, rsq),
   control = control_bayes(
     no_improve = 10,
@@ -752,7 +713,6 @@ stopImplicitCluster()
 
 
 ```{r}
-# View metrics from the first fold
 rf_grid_result$.metrics[[1]]
 ```
 
@@ -763,20 +723,17 @@ rf_grid_result$.metrics[[1]]
 We'll evaluate different strategies for selecting the best hyperparameters.
 
 ```{r select_by_rmse}
-# Selection methods based on RMSE
-# Method 1: Select model within 2% of the best RMSE, but with fewer trees
+
 best_rmse <- rf_grid_result %>% 
   select_by_pct_loss("trees",
                      metric = "rmse",
                      limit = 2) %>% 
   mutate(source = "best_rmse")
 
-# Method 2: Simply select the model with the lowest RMSE
 best_rmse_2 <- rf_grid_result %>% 
   select_best(metric = "rmse") %>% 
   mutate(source = "best_rmse_2")
 
-# Method 3: Select model within one standard error of the best RMSE
 best_rmse_3 <- rf_grid_result %>% 
   select_by_one_std_err(metric = "rmse",
                         mtry) %>% 
@@ -784,20 +741,17 @@ best_rmse_3 <- rf_grid_result %>%
 ```
 
 ```{r select_by_r2}
-# Selection methods based on R² (coefficient of determination)
-# Method 1: Select model within 2% of the best R², but with fewer trees
+
 best_r2 <- rf_grid_result %>% 
   select_by_pct_loss("trees",
                      metric = "rsq",
                      limit = 2) %>% 
   mutate(source = "best_r2")
 
-# Method 2: Simply select the model with the highest R²
 best_r2_2 <- rf_grid_result %>% 
   select_best(metric = "rsq") %>% 
   mutate(source = "best_r2_2")
 
-# Method 3: Select model within one standard error of the best R²
 best_r2_3 <- rf_grid_result %>% 
   select_by_one_std_err(metric = "rsq",
                         mtry) %>%
@@ -805,7 +759,7 @@ best_r2_3 <- rf_grid_result %>%
 ```
 
 ```{r combine_hyperparameters}
-# Combine all candidate hyperparameter sets for comparison
+
 hyperparameters_df <- best_rmse %>% 
   bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
 ```
@@ -815,9 +769,9 @@ hyperparameters_df <- best_rmse %>%
 We evaluate each set of hyperparameters on our validation data to select the best.
 
 ```{r hyperparameter_comparison_function}
-# Function to compare the performance of different hyperparameter sets
+
 compare_hyperparameters <- function(params_df, recipe, split) {
-  # Create empty tibble to store results
+
   results <- tibble(
     mtry = numeric(),
     trees = numeric(),
@@ -826,12 +780,10 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     source = character()
   )
   
-  # Loop through each row of parameters
   for(i in 1:nrow(params_df)) {
-    # Extract current parameters
+
     current_params <- params_df[i, ]
-    
-    # Create model specification with current parameters
+
     set.seed(10)
     current_spec <- rand_forest(
       mtry = current_params$mtry,
@@ -840,17 +792,14 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     ) %>%
       set_engine("ranger", importance = "permutation") %>%
       set_mode('regression')
-    
-    # Fit model on training data and evaluate on testing data
+
     current_fit <- last_fit(current_spec, recipe, split = split)
     current_metrics <- current_fit %>% collect_metrics()
-    
-    # Extract RMSE value
+
     current_rmse <- current_metrics %>% 
       filter(.metric == "rmse") %>% 
       pull(.estimate)
-    
-    # Store results
+
     results <- results %>% add_row(
       mtry = current_params$mtry,
       trees = current_params$trees,
@@ -859,8 +808,7 @@ compare_hyperparameters <- function(params_df, recipe, split) {
       source = current_params$source
     )
   }
-  
-  # Find the best combination (lowest RMSE)
+
   best_params <- results %>% 
     arrange(rmse) %>% 
     slice(1)
@@ -871,14 +819,12 @@ compare_hyperparameters <- function(params_df, recipe, split) {
   ))
 }
 
-# Compare all hyperparameter sets
 results <- compare_hyperparameters(
   params_df = hyperparameters_df,
   recipe = df_recipe,
   split = df_split
 )
 
-# Display results
 print(results)
 ```
 
@@ -887,19 +833,16 @@ print(results)
 Using the best hyperparameters, we specify our final model.
 
 ```{r final_model_specification}
-# Create the final model specification with the best hyperparameters
-# Note: Use the source identified as best from the results above
+
 final_spec <- rand_forest(
   trees = best_rmse$trees,
   mtry = best_rmse$mtry,
   min_n = best_rmse$min_n
 ) %>%
-  # Use ranger with permutation importance for later interpretation
   set_engine("ranger", importance = "permutation") %>% 
-  # Regression mode
+
   set_mode("regression")
 
-# Display the final specification  
 final_spec
 ```
 
@@ -908,7 +851,7 @@ final_spec
 Now we fit the model on the training data and evaluate on the test data.
 
 ```{r final_model_fit}
-# Fit the final model and predict on test data
+
 set.seed(10)
 final_fit <- last_fit(
   final_spec,
@@ -916,7 +859,6 @@ final_fit <- last_fit(
   split = df_split
 )
 
-# Display predictions on test data
 final_fit %>%
   collect_predictions()
 ```
@@ -926,7 +868,7 @@ final_fit %>%
 Let's examine how well our model performs on the unseen test data.
 
 ```{r test_metrics}
-# Calculate performance metrics on the test set
+
 final_fit %>%
   collect_metrics()
 ```
@@ -936,13 +878,12 @@ final_fit %>%
 For comparison, we also check performance on the training data to assess potential overfitting.
 
 ```{r train_metrics}
-# RMSE on training data
+
 train_metrics <- final_spec %>%
   fit(Yield ~ .,
       data = bake(df_prep, df_train)) %>%
   augment(new_data = bake(df_prep, df_train))
 
-# Calculate and combine RMSE and R² on training data
 train_metrics %>% 
   rmse(Yield, .pred) %>%
   bind_rows(
@@ -956,7 +897,7 @@ train_metrics %>%
 Let's visualize how well our predictions match the observed values.
 
 ```{r predicted_vs_observed}
-# Create scatter plot of predicted vs. observed values
+
 plot <- final_fit %>%
   collect_predictions() %>%
   metrica::scatter_plot(
@@ -965,14 +906,14 @@ plot <- final_fit %>%
     print_eq = TRUE,
     print_metrics = TRUE,
     metrics_list = c("R2", "RMSE", "KGE","NSE"),
-    # Customize metrics position
+
     position_metrics = c(x=1000, y=6550),
     position_eq = c(x=1000, y=5000)
   )
 
 ggsave(plot = plot,filename = '../plots/predict_vs_observed.png',width = 5,height = 5)
 
-# Display the plot
+
 plot
 ```
 
@@ -981,20 +922,18 @@ plot
 Let's calculate a comprehensive set of performance metrics.
 
 ```{r comprehensive_metrics}
-# Get predictions on test set
+
 test_results <- final_fit %>% 
   collect_predictions()
 
-# Calculate multiple performance metrics
 metrics <- test_results %>% 
   summarise(
     RMSE = rmse_vec(truth = Yield, estimate = .pred),
     R2 = rsq_vec(Yield, .pred),
     Correlation = cor(.pred, Yield),
-    SD = sd(.pred)  # Standard deviation of predictions
+    SD = sd(.pred)  
   )
 
-# Display the metrics
 print(metrics)
 ```
 
@@ -1002,14 +941,13 @@ print(metrics)
 
 
 ```{r}
-# 3. Extraer la importancia de variables
+
 vip_df <- final_fit %>%
   extract_fit_parsnip() %>%
-  vip::vi()  # Usa vip::vi() del paquete {vip}
+  vip::vi()  
 
-# 4. Visualizarla
 var_importance <- vip_df %>%
-  mutate(Variable = fct_reorder(Variable, Importance)) %>%  # <- clave para ordenar
+  mutate(Variable = fct_reorder(Variable, Importance)) %>%  
   ggplot(aes(x = Variable, y = Importance)) +
   geom_col() +
   coord_flip() + 
