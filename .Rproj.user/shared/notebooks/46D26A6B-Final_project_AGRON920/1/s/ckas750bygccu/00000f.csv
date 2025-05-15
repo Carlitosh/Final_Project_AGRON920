@@ -1,0 +1,25 @@
+"0","install.packages(""mapview"")
+"
+"2","G3;Installing package into ‘C:/Users/carlosh92/AppData/Local/R/win-library/4.5’
+(as ‘lib’ is unspecified)
+g"
+"2","G3;also installing the dependencies ‘brew’, ‘leafpop’, ‘satellite’
+
+g"
+"2","trying URL 'https://cran.rstudio.com/bin/windows/contrib/4.5/brew_1.0-10.zip'
+trying URL 'https://cran.rstudio.com/bin/windows/contrib/4.5/leafpop_0.1.0.zip'
+trying URL 'https://cran.rstudio.com/bin/windows/contrib/4.5/satellite_1.0.5.zip'
+trying URL 'https://cran.rstudio.com/bin/windows/contrib/4.5/mapview_2.11.2.zip'
+"
+"1","package ‘brew’ successfully unpacked and MD5 sums checked
+"
+"1","package ‘leafpop’ successfully unpacked and MD5 sums checked
+"
+"1","package ‘satellite’ successfully unpacked and MD5 sums checked
+"
+"1","package ‘mapview’ successfully unpacked and MD5 sums checked
+"
+"1","
+The downloaded binary packages are in
+	C:\Users\carlosh92\AppData\Local\Temp\RtmpKA1yMc\downloaded_packages
+"
